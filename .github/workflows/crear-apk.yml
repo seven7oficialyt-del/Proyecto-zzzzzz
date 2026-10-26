@@ -1,0 +1,127 @@
+name: Crear APK
+
+on:
+  # Se ejecuta solo al subir un .zip del proyecto a la raíz del repositorio
+  push:
+    paths:
+      - '*.zip'
+  # Y también a mano: pestaña Actions > Crear APK > Run workflow
+  workflow_dispatch:
+
+concurrency:
+  group: crear-apk
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # La versión de la app = número de ejecución + este valor. Debe dar un número MAYOR
+      # al de la app que ya tienes instalada (si no, Android no deja actualizar encima).
+      VERSION_OFFSET: 100
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Preparar el proyecto (descomprime el ZIP si lo hay)
+        shell: bash
+        run: |
+          set -eu
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ "${#zips[@]}" -gt 0 ]; then
+            # Prefiere el ZIP del último commit que subió uno; si no, el de número más alto
+            ZIP="$(git log -1 --name-only --pretty=format: -- '*.zip' 2>/dev/null | grep -E '^[^/]+\.zip$' | head -n 1 || true)"
+            if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+              ZIP="$(printf '%s\n' "${zips[@]}" | sort -V | tail -n 1)"
+            fi
+            echo "ZIP usado: $ZIP"
+            rm -rf _proyecto
+            mkdir _proyecto
+            unzip -q -o "$ZIP" -d _proyecto
+            SETTINGS="$(find _proyecto -maxdepth 3 -name settings.gradle | head -n 1 || true)"
+          else
+            echo "No hay ZIP en la raíz: se usa el proyecto que ya está en el repositorio"
+            SETTINGS="$(find . -maxdepth 3 -name settings.gradle -not -path './.git/*' -not -path './_proyecto/*' | head -n 1 || true)"
+          fi
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No encontré settings.gradle. Sube el ZIP del proyecto a la raíz del repositorio."
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "Proyecto en: $PROJECT_DIR"
+          test -f "$PROJECT_DIR/app/build.gradle" || { echo "::error::Falta app/build.gradle en $PROJECT_DIR"; exit 1; }
+          test -f "$PROJECT_DIR/app/miflix.jks" || { echo "::error::Falta app/miflix.jks (la firma). Sin ella el APK no se instala encima del anterior."; exit 1; }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "MF_BUILD_NO=$(( GITHUB_RUN_NUMBER + VERSION_OFFSET ))" >> "$GITHUB_ENV"
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Aceptar licencias del SDK de Android
+        shell: bash
+        run: |
+          if [ -n "${ANDROID_HOME:-}" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          fi
+          echo "SDK: ${ANDROID_HOME:-no definido}"
+
+      - name: Compilar el APK
+        shell: bash
+        run: |
+          set -eu
+          cd "$PROJECT_DIR"
+          echo "Versión de la app: 1.$MF_BUILD_NO"
+          gradle assembleDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx3g
+
+      - name: Reunir el APK
+        shell: bash
+        run: |
+          set -eu
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk" -name '*.apk' | head -n 1 || true)"
+          if [ -z "$APK" ]; then
+            echo "::error::La compilación terminó pero no se generó ningún APK."
+            exit 1
+          fi
+          mkdir -p salida
+          cp "$APK" "salida/MiFlix-1.$MF_BUILD_NO.apk"
+          ls -la salida
+
+      - name: Mostrar la firma del APK (solo informativo)
+        continue-on-error: true
+        shell: bash
+        run: |
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          "$BT/apksigner" verify --print-certs "salida/MiFlix-1.$MF_BUILD_NO.apk" | head -n 5
+          echo "La firma correcta empieza con: c428d8c65fdf47dc"
+
+      - name: Guardar el APK (Actions > la ejecución > Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiFlix-APK
+          path: salida/MiFlix-1.${{ env.MF_BUILD_NO }}.apk
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publicar en Releases (enlace de descarga directo)
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.${{ env.MF_BUILD_NO }}
+          name: MiFlix 1.${{ env.MF_BUILD_NO }}
+          target_commitish: ${{ github.sha }}
+          files: salida/MiFlix-1.${{ env.MF_BUILD_NO }}.apk
